@@ -1,0 +1,3 @@
+[submodule "cellsnake/scrna"]
+	path = cellsnake/scrna
+	url = https://github.com/theogascogne/scrna-workflow
