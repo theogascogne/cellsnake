@@ -160,38 +160,52 @@ others:
 
 
 def check_command_line_arguments(arguments):
+    # Ensure <INPUT> exists
     if not os.path.exists(arguments["<INPUT>"]):
-        print("File or input directory not found : ",arguments["<INPUT>"])
+        print("File or input directory not found: ", arguments["<INPUT>"])
         return False
-    if arguments["integrated"] and os.path.isdir(arguments["<INPUT>"]):
-        print("You are running integrated option but you provided a directory, not a Seurat object file !")
-        print("The default Seurat object is usually here, analyses_integrated/seurat/integrated.rds")
-        print("""You can try something like: "cellsnake integrated standard analyses_integrated/seurat/integrated.rds""")
+
+    # Validate 'integrated' option with directory input
+    if arguments.get("integrated") and os.path.isdir(arguments["<INPUT>"]):
+        print("You are running the integrated option, but you provided a directory, not a Seurat object file!")
+        print("The default Seurat object is usually here: analyses_integrated/seurat/integrated.rds")
+        print("You can try something like: cellsnake integrated standard analyses_integrated/seurat/integrated.rds")
         return False
-    if arguments["integrated"] and os.path.isfile(arguments["<INPUT>"]):
+    
+    # Validate 'integrated' with invalid file type
+    if arguments.get("integrated") and os.path.isfile(arguments["<INPUT>"]):
         file_extension = pathlib.Path(arguments["<INPUT>"])
-        if (file_extension.suffix).lower() not in [".rds"]:
-            print("You are running integrated option but you provided not a Seurat object file !")
-            print("The default Seurat object is usually here, analyses_integrated/seurat/integrated.rds")
-            print("""You can try something like: \n cellsnake integrated standard analyses_integrated/seurat/integrated.rds""")
+        if file_extension.suffix.lower() != ".rds":
+            print("You are running the integrated option, but the file is not a Seurat object file (.rds)!")
+            print("The default Seurat object is usually here: analyses_integrated/seurat/integrated.rds")
+            print("You can try something like: cellsnake integrated standard analyses_integrated/seurat/integrated.rds")
             return False
-    if arguments["--configfile"]:
-         if not os.path.isfile(arguments["--configfile"]):
-            print("Config file given not found : ",arguments["--configfile"])
-            return False
-    if arguments["--metadata"]:
-         if not os.path.isfile(arguments["--metadata"]):
-            print("Metadata file given not found : ",arguments["--metadata"])
-            return False
-    if arguments["--kraken_db_folder"]:
-        if not os.path.exists(arguments["--kraken_db_folder"]) and not os.path.isfile(arguments["--kraken_db_folder"] + "/inspect.txt"):
-            print("KrakenDB directory not found : ",arguments["--kraken_db_folder"])
-            print("You should download a proper DB from this link (https://benlangmead.github.io/aws-indexes/k2), unpack it and point that directory.")
-            return False
-    if arguments["--taxa"] not in ["domain", "kingdom", "phylum", "class", "order", "family", "genus", "species"]:
-        print("Select a correct taxa level for microbiome analysis:",arguments["--taxa"])
-        print("Possible options : ",["domain", "kingdom", "phylum", "class", "order", "family", "genus", "species"])
+
+    # Validate config file
+    if arguments.get("--configfile") and not os.path.isfile(arguments["--configfile"]):
+        print("Config file not found: ", arguments["--configfile"])
         return False
+
+    # Validate metadata file
+    if arguments.get("--metadata") and not os.path.isfile(arguments["--metadata"]):
+        print("Metadata file not found: ", arguments["--metadata"])
+        return False
+
+    # Validate Kraken DB folder
+    if arguments.get("--kraken_db_folder"):
+        kraken_db_folder = arguments["--kraken_db_folder"]
+        if not os.path.exists(kraken_db_folder) and not os.path.isfile(kraken_db_folder + "/inspect.txt"):
+            print("KrakenDB directory not found: ", kraken_db_folder)
+            print("You should download a proper DB from this link: https://benlangmead.github.io/aws-indexes/k2")
+            return False
+
+    # Validate taxa level
+    valid_taxa = ["domain", "kingdom", "phylum", "class", "order", "family", "genus", "species"]
+    if arguments.get("--taxa") not in valid_taxa:
+        print("Select a correct taxa level for microbiome analysis:", arguments["--taxa"])
+        print("Possible options: ", valid_taxa)
+        return False
+
     return True
 
 
@@ -243,35 +257,45 @@ class CommandLine:
 
 
 
-
-
-
-        
-
     def prepare_arguments(self,arguments):
-        self.snakemake = self.snakemake +  " -j {} ".format(arguments['--jobs']) #set CPU number
-        self.snakemake = self.snakemake +  " -s {} ".format(f"{cellsnake_path}/scrna/workflow/Snakefile") #set Snakefile location
+        # Set base snakemake arguments
+        self.snakemake += f" -j {arguments['--jobs']} "  # Set CPU number
+        self.snakemake += f" -s {cellsnake_path}/scrna/workflow/Snakefile "  # Set Snakefile location
+
+        # Load config file if available
         self.load_configfile_if_available(arguments)
+        
         if self.is_this_an_integration_run is False:
-            self.config.append("datafolder={}".format(arguments['<INPUT>']))
+            self.config.append(f"datafolder={arguments['<INPUT>']}")
 
         self.config.append(f"cellsnake_path={cellsnake_path}/scrna/")
-        for i,b in arguments.items():
-            if i not in ["--jobs","integrated","--configfile","--option","--gene","--kraken_db_folder","--unlock","--remove","--dry","--help","--version","<INPUT>","<command>","--install-packages","--generate-template"]:
-                k=i.lstrip("--")
-                if self.configfile_loaded is False: #if there is no config file, add all parameters given by the command line or defaults. command line parameters have priority over config file parameters
-                    self.config.append(k + "=" + str(b))
-                    self.parameters[k]=str(b)
+
+        # Iterate through arguments and add them to config, excluding specific ones
+        excluded_args = [
+            "--jobs", "integrated", "--configfile", "--option", "--gene", "--kraken_db_folder",
+            "--unlock", "--remove", "--dry", "--help", "--version", "<INPUT>", "<command>",
+            "--install-packages", "--generate-template"
+        ]
+
+        for param, value in arguments.items():
+            if param not in excluded_args:
+                key = param.lstrip("--")
+                if not self.configfile_loaded:  # If no config file loaded, use command-line params
+                    self.config.append(f"{key}={value}")
+                    self.parameters[key] = str(value)
+                elif self.parameters.get(key) and key not in sys.argv:
+                    # If parameter exists, use the existing value (not from command line)
+                    self.config.append(f"{key}={self.parameters.get(key)}")
                 else:
-                    if self.parameters.get(k) and i not in sys.argv:
-                        self.config.append(k + "=" + str(self.parameters.get(k)))
-                    else:
-                        self.config.append(k + "=" + str(b))
-                        self.parameters[k]=str(b)
+                    # Otherwise, use the current value from the command line
+                    self.config.append(f"{key}={value}")
+                    self.parameters[key] = str(value)
 
 
-        
+        # add run id
         self.config.append("runid={}".format(self.runid))
+
+
         if arguments["--gene"]:
             if os.path.isfile(arguments["--gene"]):
                 self.config.append("selected_gene_file={}".format(arguments["--gene"]))
@@ -302,6 +326,7 @@ class CommandLine:
             self.log=False
         self.add_config_argument()
         
+        
     
     def write_to_log(self,start):
         logname = "_".join(["cellsnake",self.runid, datetime.datetime.now().strftime("%y%m%d_%H%M%S"),"runlog"])
@@ -318,7 +343,7 @@ class CommandLine:
                 f.write("Run parameters: " + str(self.parameters) + "\n\n")
                 f.write("Total run time: {t:.2f} mins \n".format(t=(stop-start)/60))
 
-
+#This function is not in use.
 def run_integration(arguments):
 
     start = timeit.default_timer()
@@ -344,42 +369,51 @@ def run_integration(arguments):
 
 def run_workflow(arguments):
     start = timeit.default_timer()
-    snakemake_argument=CommandLine()
+    snakemake_argument = CommandLine()
+    
     if arguments["integrated"]:
         snakemake_argument.is_integrated_sample = True
+    
     snakemake_argument.prepare_arguments(arguments)
-    subprocess.check_call(str(snakemake_argument),shell=True)
+    
+    # We can actually run the command using os.system()
+    command = str(snakemake_argument)
+    exit_code = os.system(command)
+    
+    # Check exit status of the command
+    if exit_code != 0:
+        print(f"Error: Command failed with exit code {exit_code}")
+        return
+    
     snakemake_argument.write_to_log(start)
 
 
 def main():
-        cli_arguments = docopt(__doc__, version=__version__)
-        if cli_arguments["--generate-template"]:
-            print("Generating config.yaml file...")
-            print("You can use this as a template for a cellsnake run. You may change the settings.")
-            shutil.copyfile(cellsnake_path + "/scrna/config.yaml", 'config.yaml')
-            print("Generating metadata.csv file...")
-            with open("metadata.csv","w") as f:
-                f.write("sample,condition\n")
-                f.write("sample1,condition1\n")
-                f.write("sample2,condition2\n")
-            return
-        if cli_arguments["--install-packages"]:
-            subprocess.check_call(cellsnake_path + "/scrna/workflow/scripts/scrna-install-packages.R")
-            return
-        
-        if not check_command_line_arguments(cli_arguments):
-            print("""Please check your command line arguments. Use "cellsnake --help" for more information""")
-            return
+    cli_arguments = docopt(__doc__, version=__version__)
 
+    if cli_arguments["--generate-template"]:
+        print("Generating config.yaml file...")
+        print("You can use this as a template for a cellsnake run. You may change the settings.")
+        shutil.copyfile(cellsnake_path + "/scrna/config.yaml", 'config.yaml')
 
-        if cli_arguments['<command>'] == 'minimal':
-            run_workflow(cli_arguments)
-        if cli_arguments['<command>'] == 'standard':
-            run_workflow(cli_arguments)
-        if cli_arguments['<command>'] == 'advanced':
-            run_workflow(cli_arguments)
-        if cli_arguments['<command>'] == 'clustree':
-            run_workflow(cli_arguments)
-        if cli_arguments['<command>'] == 'integrate':
-            run_workflow(cli_arguments)
+        print("Generating metadata.csv file...")
+        with open("metadata.csv", "w") as f:
+            f.write("sample,condition\n")
+            f.write("sample1,condition1\n")
+            f.write("sample2,condition2\n")
+        return
+
+    if cli_arguments["--install-packages"]:
+        subprocess.check_call(cellsnake_path + "/scrna/workflow/scripts/scrna-install-packages.R")
+        return
+
+    if not check_command_line_arguments(cli_arguments):
+        print("""Please check your command line arguments. Use "cellsnake --help" for more information""")
+        return
+
+    # List of valid commands
+    valid_commands = ['minimal', 'standard', 'advanced', 'clustree', 'integrate']
+    
+    # If the command is in the valid commands list, run the workflow
+    if cli_arguments['<command>'] in valid_commands:
+        run_workflow(cli_arguments)
