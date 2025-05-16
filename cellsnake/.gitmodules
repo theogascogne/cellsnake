@@ -1,0 +1,3 @@
+[submodule "scrna"]
+    path = scrna
+    url = https://github.com/theogascogne/scrna-workflow
