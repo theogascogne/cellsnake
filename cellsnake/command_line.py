@@ -5,6 +5,20 @@ cellsnake main
 @author: Sinan U. Umu, sinanugur@gmail.com
 '''
 
+# =============================================================================
+# cellsnake CLI entrypoint
+#
+# Usage:
+#   This script is invoked by users via the `cellsnake` CLI to run various
+#   scRNA-seq workflows (e.g. minimal, standard, integrated). It parses CLI
+#   arguments, validates input, builds a snakemake command, and optionally
+#   logs the run.
+#   Example of a command: cellsnake standard <input>
+#   Please note that the input has to be named 'data' and follow a file path pattern.
+#   The provided test sample in the Readme is an example of this
+#   Or the data folder within cellsnake's test directory
+# =============================================================================
+
 #from __future__ import print_function
 import re
 import warnings
@@ -24,7 +38,7 @@ import yaml
 from yaml.loader import SafeLoader
 from subprocess import call
 import pathlib
-
+from pathlib import Path
 
 #from schema import Schema, And, Or, Use, SchemaError
 
@@ -32,7 +46,7 @@ from collections import defaultdict
 
 import cellsnake
 cellsnake_path=os.path.dirname(cellsnake.__file__)
-options = ["clustree","clusteringTree","minimal","standard","advanced"] #and integration
+options = ["clustree","clusteringTree","minimal","standard","advanced", "test"] #and integration
 
 
 __author__ = 'Sinan U. Umu'
@@ -67,6 +81,11 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
+
+#================================================
+# To add more functionality to cellsnake, please
+# add them to this list below with a description
+#================================================
 
 __doc__=f"""Main cellsnake executable, version: {__version__}
 {__logo__} 
@@ -117,6 +136,8 @@ other options:
     --scale_factor <integer>               [default: 10000]
     --logfc_threshold <double>             [default: 0.25]
     --test_use <text>                      [default: wilcox]
+    
+    --persist <text>                       [default: False] #An experimental feature, runs the workflow on a persistent R session. It is unstable and only works for Minimal workflow.
 
 
     --mapping <text>                       [default: org.Hs.eg.db] #you may install others from Bioconductor, this is for human
@@ -155,13 +176,32 @@ others:
     -d, --dry                              Dry run, nothing will be generated.
     -h, --help                             Show this screen.
     --version                              Show version.
-    
+    --lint                                 Linting.
+    --stats                                Show workflow metrics.
 """
+
+#=============================
+# Function: check_command_line_arguments(arguments)
+#
+# Purpose:
+#   Validates the command-line arguments passed to the `cellsnake` CLI tool.
+#   This function ensures required files and options are correctly set up before
+#   the pipeline begins execution. Returns False on invalid inputs.
+#
+#   Ensures an <INPUT> path exists unless the command is 'test'
+#   If the 'integrated' option is set, confirms the input is a valid Seurat .rds file
+#   Verifies that required files like --configfile and --metadata exist
+#   If --kraken_db_folder is specified, confirms it exists and has the expected structure
+#   Checks that --taxa, if given, is one of the accepted taxonomy levels
+#
+# Returns:
+#   True if all validations pass, otherwise False (with a descriptive error message)
+#=============================
 
 
 def check_command_line_arguments(arguments):
-    # Ensure <INPUT> exists
-    if not os.path.exists(arguments["<INPUT>"]):
+    # Ensure <INPUT> exists, but only if it's not a 'test' mode
+    if not arguments.get("<command>") == "test" and not os.path.exists(arguments["<INPUT>"]):
         print("File or input directory not found: ", arguments["<INPUT>"])
         return False
 
@@ -193,8 +233,8 @@ def check_command_line_arguments(arguments):
 
     # Validate Kraken DB folder
     if arguments.get("--kraken_db_folder"):
-        kraken_db_folder = arguments["--kraken_db_folder"]
-        if not os.path.exists(kraken_db_folder) and not os.path.isfile(kraken_db_folder + "/inspect.txt"):
+        kraken_db_folder = Path(arguments["--kraken_db_folder"])  # convert here
+        if not kraken_db_folder.exists() and not (kraken_db_folder / "inspect.txt").is_file():
             print("KrakenDB directory not found: ", kraken_db_folder)
             print("You should download a proper DB from this link: https://benlangmead.github.io/aws-indexes/k2")
             return False
@@ -208,142 +248,143 @@ def check_command_line_arguments(arguments):
 
     return True
 
+#=============================
+#
+# CommandLine builds the full Snakemake command for running the Cellsnake pipeline.
+#
+# - Initializes with a base command and a random run ID.
+# - Loads config from --configfile (if provided) or from command-line arguments.
+# - Assembles Snakemake options:
+#     CPU count (--jobs), Snakefile path, key=value config pairs
+#     Special flags: --dry, --unlock, --remove
+# - Handles integration-specific options and optional inputs (e.g., --gene, --kraken_db_folder).
+# - Writes a log of the full command, parameters, and runtime.
+#
+# Example output:
+# snakemake --rerun-incomplete -k -j 8 -s /path/to/Snakefile \
+#   --config datafolder=my_data/ gene_to_plot=TP53 runid=abc12345 ...
+#
+#=============================
 
 class CommandLine:
     def __init__(self):
-        self.snakemake="snakemake --retries 5 --rerun-incomplete -k "
-        self.runid="".join(random.choices("abcdefghisz",k=3) + random.choices("123456789",k=5))
-        self.config=[]
-        self.configfile_loaded=False
-        self.is_integrated_sample=False
-        self.is_this_an_integration_run=False
-        self.parameters=dict()
-        self.log=True #if dry unlock etc, no logging
-        
+        self.snakemake = "snakemake --rerun-incomplete -k "  # Base Snakemake command
+        self.runid = "".join(random.choices("abcdefghisz", k=3) + random.choices("123456789", k=5))  # Random run ID
+        self.config = []                         # Holds config key=value pairs
+        self.configfile_loaded = False           # Flag to check if config file was loaded
+        self.is_integrated_sample = False        # Whether sample is part of an integration
+        self.is_this_an_integration_run = False  # Whether this is an integration run
+        self.parameters = dict()                 # Stores all run parameters
+        self.log = True                          # Logging enabled unless overridden by dry/unlock/remove/test
+
     def __str__(self):
         return self.snakemake
+
     def __repr__(self):
         return self.snakemake
-    
-
-
-
-        
 
     def add_config_argument(self):
-        self.snakemake = self.snakemake + " --config " + " ".join(self.config)
+        # Add accumulated config arguments to the snakemake command
+        self.snakemake += " --config " + " ".join(self.config)
 
+    def load_configfile_if_available(self, arguments):
+        # Load YAML config file if provided and not already loaded
+        if not self.configfile_loaded and arguments["--configfile"]:
+            self.snakemake += f" --configfile={arguments['--configfile']}"
+            configfile = arguments["--configfile"]
+            with open(configfile) as f:
+                self.parameters = yaml.load(f, Loader=SafeLoader)
+            self.configfile_loaded = True
 
-    def load_configfile_if_available(self,arguments):
-        if self.configfile_loaded is False:
-            if arguments["--configfile"]:
-                self.snakemake = self.snakemake + " --configfile={}".format(arguments["--configfile"])
-                configfile=arguments["--configfile"]
-            #else:
-            #    self.snakemake = self.snakemake + " --configfile={}".format(cellsnake_path + "/scrna/config.yaml")
-            #    configfile=cellsnake_path + "/scrna/config.yaml"
+    def prepare_arguments(self, arguments):
+        # Build Snakemake command line using arguments
+        self.snakemake += f" -j {arguments['--jobs']} "  # Number of cores
+        self.snakemake += f" -s {cellsnake_path}/scrna/workflow/Snakefile "  # Path to Snakefile
 
-                with open(configfile) as f:
-                    self.parameters=yaml.load(f,Loader=SafeLoader)
-                self.configfile_loaded=True
-        
-                #self.change_parameters(arguments)
+        self.load_configfile_if_available(arguments)  # Load config file if specified
 
-    #def change_parameters(self,arguments): #change parameters if there is a config file
-    #    if self.configfile_loaded is True and arguments["--configfile"]:
-    #        arguments["--resolution"] = self.parameters["resolution"]
-    #        arguments["--percent_mt"] = self.parameters["percent_mt"]
-    #        arguments["--taxa"] = self.parameters["taxa"]
-
-
-
-    def prepare_arguments(self,arguments):
-        # Set base snakemake arguments
-        self.snakemake += f" -j {arguments['--jobs']} "  # Set CPU number
-        self.snakemake += f" -s {cellsnake_path}/scrna/workflow/Snakefile "  # Set Snakefile location
-
-        # Load config file if available
-        self.load_configfile_if_available(arguments)
-        
-        if self.is_this_an_integration_run is False:
+        # Add input folder unless this is an integration run
+        if not self.is_this_an_integration_run:
             self.config.append(f"datafolder={arguments['<INPUT>']}")
 
-        self.config.append(f"cellsnake_path={cellsnake_path}/scrna/")
+        self.config.append(f"cellsnake_path={cellsnake_path}/scrna/")  # Add pipeline path
 
-        # Iterate through arguments and add them to config, excluding specific ones
+        # Exclude these arguments from being passed as config key=value
         excluded_args = [
             "--jobs", "integrated", "--configfile", "--option", "--gene", "--kraken_db_folder",
             "--unlock", "--remove", "--dry", "--help", "--version", "<INPUT>", "<command>",
             "--install-packages", "--generate-template"
         ]
 
+        # Handle general parameters and convert them to config entries
         for param, value in arguments.items():
             if param not in excluded_args:
                 key = param.lstrip("--")
-                if not self.configfile_loaded:  # If no config file loaded, use command-line params
+                if not self.configfile_loaded:
                     self.config.append(f"{key}={value}")
                     self.parameters[key] = str(value)
                 elif self.parameters.get(key) and key not in sys.argv:
-                    # If parameter exists, use the existing value (not from command line)
                     self.config.append(f"{key}={self.parameters.get(key)}")
                 else:
-                    # Otherwise, use the current value from the command line
                     self.config.append(f"{key}={value}")
                     self.parameters[key] = str(value)
 
+        self.config.append(f"runid={self.runid}")  # Add random run ID
 
-        # add run id
-        self.config.append("runid={}".format(self.runid))
-
-
+        # Handle gene input: either a file or single gene name
         if arguments["--gene"]:
             if os.path.isfile(arguments["--gene"]):
-                self.config.append("selected_gene_file={}".format(arguments["--gene"]))
+                self.config.append(f"selected_gene_file={arguments['--gene']}")
             else:
-                self.config.append("gene_to_plot={}".format(arguments["--gene"]))
+                self.config.append(f"gene_to_plot={arguments['--gene']}")
 
+        # Handle Kraken DB path
         if arguments["--kraken_db_folder"]:
-            self.config.append("kraken_db_folder={}".format(arguments["--kraken_db_folder"]))
-            
+            self.config.append(f"kraken_db_folder={arguments['--kraken_db_folder']}")
 
+        # Integration sample flag
         if self.is_integrated_sample:
-            self.config.append("is_integrated_sample={}".format("True"))
+            self.config.append("is_integrated_sample=True")
 
-
-        if  self.is_this_an_integration_run is False:
-            self.config.append("option={}".format(arguments['<command>']))
-         
-        elif self.is_this_an_integration_run:
+        # Add operation type (standard or integration)
+        if not self.is_this_an_integration_run:
+            self.config.append(f"option={arguments['<command>']}")
+        else:
             self.config.append("option=integration")
+
+        # Handle special Snakemake modes
         if arguments["--dry"]:
-            self.snakemake = self.snakemake + " -n "
-            self.log=False
+            self.snakemake += " -n "
+            self.log = False
         if arguments["--unlock"]:
-            self.snakemake = self.snakemake + " --unlock "
-            self.log=False
+            self.snakemake += " --unlock "
+            self.log = False
         if arguments["--remove"]:
-            self.snakemake = self.snakemake + " --delete-all-output "
-            self.log=False
-        self.add_config_argument()
-        
-        
-    
-    def write_to_log(self,start):
-        logname = "_".join(["cellsnake",self.runid, datetime.datetime.now().strftime("%y%m%d_%H%M%S"),"runlog"])
+            self.snakemake += " --delete-all-output "
+            self.log = False
+        if arguments["<command>"] == "test":
+            self.config.append(f"test_mode={arguments['<INPUT>']}")
+            self.log = False
+
+        self.add_config_argument()  # Finalize config arguments
+
+    def write_to_log(self, start):
+        # Log run information and duration to a timestamped file
+        logname = "_".join(["cellsnake", self.runid, datetime.datetime.now().strftime("%y%m%d_%H%M%S"), "runlog"])
         stop = timeit.default_timer()
         if self.log:
-            with open(logname,"w") as f:
+            with open(logname, "w") as f:
                 f.write(__logo__ + "\n")
-                f.write("Run ID : " + self.runid + "\n")
-                f.write("Cellnake version : " + __version__ + "\n")
-                f.write("Cellsnake arguments : " + " ".join(sys.argv) + "\n\n")
-                f.write("------------------------------" + "\n")
-                f.write("Snakemake arguments : " + str(self.snakemake) + "\n\n")
-                f.write("------------------------------" + "\n")
-                f.write("Run parameters: " + str(self.parameters) + "\n\n")
-                f.write("Total run time: {t:.2f} mins \n".format(t=(stop-start)/60))
-
-#This function is not in use.
+                f.write(f"Run ID : {self.runid}\n")
+                f.write(f"Cellnake version : {__version__}\n")
+                f.write(f"Cellsnake arguments : {' '.join(sys.argv)}\n\n")
+                f.write("------------------------------\n")
+                f.write(f"Snakemake arguments : {self.snakemake}\n\n")
+                f.write("------------------------------\n")
+                f.write(f"Run parameters: {self.parameters}\n\n")
+                f.write("Total run time: {:.2f} mins\n".format((stop - start) / 60))
+                
+#This function, run_integration, is currently not in use.
 def run_integration(arguments):
 
     start = timeit.default_timer()
@@ -366,31 +407,77 @@ def run_integration(arguments):
     #snakemake_argument.prepare_arguments(arguments)
     #subprocess.check_call(str(snakemake_argument),shell=True)
     #return snakemake_argument
+    
+# ======================================
+#   run_workflow(arguments)
+
+#   Given parsed CLI arguments:
+#   Initializes CommandLine instance and sets flags.
+#   Prepares snakemake command with all configs.
+#   Executes command using os.system().
+#   Checks for execution errors and writes run logs if successful.
+# =======================================
 
 def run_workflow(arguments):
-    start = timeit.default_timer()
-    snakemake_argument = CommandLine()
-    
+    start = timeit.default_timer()  # Track start time
+    snakemake_argument = CommandLine()  # Initialize command line builder
+
     if arguments["integrated"]:
-        snakemake_argument.is_integrated_sample = True
-    
-    snakemake_argument.prepare_arguments(arguments)
-    
-    # We can actually run the command using os.system()
+        snakemake_argument.is_integrated_sample = True  # Mark as integrated sample
+
+    snakemake_argument.prepare_arguments(arguments)  # Construct full command
+
+    # Convert command object to string and run using shell
     command = str(snakemake_argument)
     exit_code = os.system(command)
-    
-    # Check exit status of the command
+
+    # Handle failed run
     if exit_code != 0:
         print(f"Error: Command failed with exit code {exit_code}")
         return
-    
-    snakemake_argument.write_to_log(start)
 
+    # Log successful run
+    snakemake_argument.write_to_log(start)
+    
+# =============================
+# main()
+#
+#   Parses CLI arguments with docopt.
+#   Handles special commands/flags:
+#     -test modes (all, cover)
+#     -lint check on Snakefile
+#     -generate template config and metadata files
+#     -install required R packages
+#   Validates arguments.
+#   Runs the workflow for valid commands.
+# =============================
 
 def main():
     cli_arguments = docopt(__doc__, version=__version__)
+    
+    # Handle test mode input "cellsnake test all"
+    if cli_arguments['<command>'] == "test":
+        if cli_arguments["<INPUT>"] is None:
+            print("Please provide a test mode (e.g., `cellsnake test all` or `cellsnake test cover`)")
+            return
 
+        mode = cli_arguments["<INPUT>"]
+        if mode not in ["all", "cover"]:
+            print(f"Unknown test mode/input '{INPUT}', It is not supposed to be a directory if that was used , please use 'all' or 'cover'.")
+            return
+        print(f"Running test in '{mode}' mode...")
+    
+    # Run Snakemake's linting system
+    if cli_arguments.get("--lint"):
+        snakefile_path = f"{cellsnake_path}/scrna/workflow/Snakefile"
+        result = os.system(f"snakemake --lint -s {snakefile_path}")
+        if result == 0:
+            print("Snakemake lint check passed.")
+        else:
+            print("Lint check found issues.")
+        return
+    
+    # Generate template config and metadata files
     if cli_arguments["--generate-template"]:
         print("Generating config.yaml file...")
         print("You can use this as a template for a cellsnake run. You may change the settings.")
@@ -412,7 +499,7 @@ def main():
         return
 
     # List of valid commands
-    valid_commands = ['minimal', 'standard', 'advanced', 'clustree', 'integrate']
+    valid_commands = ['minimal', 'standard', 'advanced', 'clustree', 'integrate', 'test']
     
     # If the command is in the valid commands list, run the workflow
     if cli_arguments['<command>'] in valid_commands:
